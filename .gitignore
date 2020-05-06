@@ -1,0 +1,6 @@
+/node_modules/
+/tip-tools/credentials.json
+/tip-tools/token.pickle
+/.python-version
+/.idea/
+/.envrc

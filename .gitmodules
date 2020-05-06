@@ -1,0 +1,3 @@
+[submodule "tip-initiative-apis"]
+	path = tip-initiative-apis
+	url = https://github.com/tip-initiative/tip-initiative-apis.git
