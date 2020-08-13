@@ -1,3 +1,8 @@
+"""Generator for TIP APIs"""
+
+# TODO: DailyUnitDistribution nullable
+# TODO: SalesElementTransactionDate nullable
+
 import ast
 import pickle
 import re
@@ -6,7 +11,7 @@ import tempfile
 from contextlib import suppress
 from copy import copy
 from pathlib import Path
-from typing import List, Any, Union, Dict, Iterable
+from typing import List, Any, Union, Dict, Iterable, Set
 
 import attr
 from google.auth.transport.requests import Request
@@ -26,13 +31,12 @@ PAGE_WIDTH = 99
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
 
 # The ID and range of a sample spreadsheet.
-# DRAFT: SHEET_ID = "1J1v6ol6hSEWSlUPF4ZPMq-TMc_See3ZprvwjS_HqZic"
-SHEET_ID = "15Y3G_RdBfnkXNdhbrYCPa0Cg0FMkCK6-vebIRhALPjg"
+SHEET_ID = "1J1v6ol6hSEWSlUPF4ZPMq-TMc_See3ZprvwjS_HqZic"
 
 # Directory where the schemas live.
 SCHEMAS = Path(__file__).absolute().parents[1] / "tip-initiative-apis" / "endpoints" / "schemas"
 
-VERSION: str = "5.0.0"
+VERSION: str = "5.1.0"
 
 
 @attr.s(frozen=True, slots=True)
@@ -42,6 +46,7 @@ class Sheet:
     start_row: int = attr.ib()
     title: str = attr.ib()
     description: str = attr.ib()
+    names: Set[str] = attr.ib(factory=set)
 
     @property
     def range(self) -> str:
@@ -139,14 +144,22 @@ class ModelRow:
             r = self.parse_ref()
 
         if "array" in self.type.lower():
+            if not self.name.endswith("s"):
+                print(
+                    f"ERROR: Array should be plural in {self.sheet.name}:{line_num}:{self.name}"
+                )
             try:
                 real_type = {"type": r["type"]}
             except KeyError:
                 real_type = {"$ref": r["$ref"]}
             r = {"type": "array", "items": real_type}
             if constraints := self.enum_values.strip():
-                vals = ast.literal_eval(constraints)
-                r.update(vals)
+                try:
+                    vals = ast.literal_eval(constraints)
+                    r.update(vals)
+                except (SyntaxError, ValueError):
+                    print(f"WARNING: AST error in {self.sheet.name}:{line_num}")
+                    raise
 
         rr = {}
 
@@ -158,14 +171,19 @@ class ModelRow:
         return {self.name: rr}
 
     def parse_ref(self) -> dict:
-        self.description = ""
-        prefix = "#" if self.sheet.name == "Common Schemas" else "commonSchemas.yaml#"
+        if not self.type.lower() == "array":
+            self.description = ""
+        prefix = "#" if self.data_type.strip() in self.sheet.names else "commonSchemas.yaml#"
         ref = f"{prefix}/components/schemas/{self.data_type.strip()}"
         return {"$ref": SingleQuotedScalarString(ref)}
 
-    @staticmethod
-    def parse_string() -> dict:
-        return {"type": "string"}
+    def parse_string(self) -> dict:
+        r = {"type": "string"}
+        if constraints := self.enum_values.strip():
+            with suppress(ValueError):
+                vals = ast.literal_eval(constraints)
+                r.update(vals)
+        return r
 
     def parse_enum(self):
         vals = [n.strip() for n in self.enum_values.split(",")]
@@ -174,8 +192,9 @@ class ModelRow:
     def parse_int(self):
         r = {"type": "integer"}
         if constraints := self.enum_values.strip():
-            vals = ast.literal_eval(constraints)
-            r.update(vals)
+            with suppress(ValueError):
+                vals = ast.literal_eval(constraints)
+                r.update(vals)
         return r
 
     @staticmethod
@@ -201,13 +220,21 @@ class ModelRow:
     def parse_double():
         return {"type": "number", "format": "double"}
 
-    @staticmethod
-    def parse_bool():
-        return {"type": "boolean"}
+    def parse_bool(self):
+        r = {"type": "boolean"}
+        if constraints := self.enum_values.strip():
+            with suppress(ValueError):
+                vals = ast.literal_eval(constraints)
+                r.update(vals)
+        return r
 
-    @staticmethod
-    def parse_email():
-        return {"type": "string", "format": "email"}
+    def parse_email(self):
+        r = {"type": "string", "format": "email"}
+        if constraints := self.enum_values.strip():
+            with suppress(ValueError):
+                vals = ast.literal_eval(constraints)
+                r.update(vals)
+        return r
 
     def parse_many(self):
         types = []
@@ -282,7 +309,7 @@ def google_creds():
     return creds
 
 
-def main(sheets: Iterable[Sheet]):
+def parse_sheets(sheets: Iterable[Sheet]):
     service = build("sheets", "v4", credentials=google_creds())
 
     sheet: Sheet
@@ -294,6 +321,21 @@ def main(sheets: Iterable[Sheet]):
         values = result.get("values", [])
         if not values:
             return
+
+        # Preparse for field names
+        c: int
+        v: List[str]
+        for c, v in enumerate(values):
+            row_num = c + 1
+
+            # Don't start reading until we hit the important stuff
+            if row_num < sheet.start_row:
+                continue
+
+            # Skip the row if the "name" field is empty
+            with suppress(TypeError):
+                row: ModelRow = ModelRow.from_list(v)
+                sheet.names.add(row.name)
 
         schemas: Dict[str, Dict[str, Union[List[str], Dict[str]]]] = {}
         klass: str = ""
@@ -324,7 +366,7 @@ def main(sheets: Iterable[Sheet]):
                 break
 
             if not row.description and purpose and row_num == sheet.start_row:
-                row.description = purpose
+                row.description = clean_description(purpose)
 
             if row.type == "TypeDef":
                 klass = row.name
@@ -332,6 +374,9 @@ def main(sheets: Iterable[Sheet]):
 
                 if row.data_type.lower() == "enum":
                     r = row.parse_enum()
+                    schemas[klass] = r
+                elif row.data_type.lower() == "string":
+                    r = row.parse_string()
                     schemas[klass] = r
 
                 # Add description to new TypeDef. Gymnastics here to preserve order of fields.
@@ -385,25 +430,76 @@ def re_dump(file_path: Union[Path, str]):
         yaml.dump(xyz)
 
 
-def other_main():
+def _generate_schemas():
+    sheets: List[Sheet] = [
+        Sheet(
+            schema=SCHEMAS / "commonSchemas.yaml",
+            name="Common Schemas",
+            start_row=5,
+            title="Common Schemas",
+            description="Common Schemas",
+        ),
+        Sheet(
+            schema=SCHEMAS / "logTimesSchemas.yaml",
+            name="/seller/logtimes",
+            start_row=11,
+            title="logTimes Schemas",
+            description="logTimes Schemas",
+        ),
+        Sheet(
+            schema=SCHEMAS / "invoiceSchemas.yaml",
+            name="/seller/invoices",
+            start_row=11,
+            title="Invoice Schema",
+            description="Invoice Schema",
+        ),
+        Sheet(
+            schema=SCHEMAS / "commercialInstructionSchemas.yaml",
+            name="/buyer/commercialInstructions",
+            start_row=11,
+            title="Commercial Instructions Schema",
+            description="Commercial Instructions Schema",
+        ),
+        Sheet(
+            schema=SCHEMAS / "rfpsSchemas.yaml",
+            name="/buyer/RFPS",
+            start_row=11,
+            title="RFP Schema",
+            description="RFP Schema",
+        ),
+        Sheet(
+            schema=SCHEMAS / "proposalSchemas.yaml",
+            name="/seller/proposals",
+            start_row=11,
+            title="Create a proposal to send to the buyer system",
+            description="Seller/Proposal Schemas",
+        ),
+        Sheet(
+            schema=SCHEMAS / "ordersSchemas.yaml",
+            name="/buyer/orders",
+            start_row=11,
+            title="Buyer requesting New Order or Order Change Request to Seller",
+            description="Buyer/Order",
+        ),
+        Sheet(
+            schema=SCHEMAS / "impressionsSchemas.yaml",
+            name="/seller/impressions",
+            start_row=11,
+            title="Seller delivers impression-level log data to buyer system",
+            description="Supports a push model where the seller sends files to buyer system "
+            "on an agreed schedule.  Supports a report limited to a single advertiser, brand, "
+            "product and order.",
+        ),
+    ]
+
+    parse_sheets(sheets)
+
+
+def _generate_inventory_avails():
     with tempfile.TemporaryDirectory() as tmpdirname:
         temp_path = Path(tmpdirname)
 
-        sheets: List[Sheet] = [
-            Sheet(
-                schema=SCHEMAS / "commonSchemas.yaml",
-                name="Common Schemas",
-                start_row=6,
-                title="Common Schemas",
-                description="Common Schemas",
-            ),
-            Sheet(
-                schema=SCHEMAS / "logTimesSchemas.yaml",
-                name="/seller/logtimes",
-                start_row=11,
-                title="logTimes Schemas",
-                description="logTimes Schemas",
-            ),
+        sheets = [
             Sheet(
                 schema=temp_path / "buyer/inventoryAvailsSchemas.yaml",
                 name="/buyer/inventoryAvails",
@@ -418,85 +514,9 @@ def other_main():
                 title="Inventory Avails Schemas",
                 description="Inventory Avails Schemas",
             ),
-            Sheet(
-                schema=SCHEMAS / "invoiceSchemas.yaml",
-                name="/seller/invoice",
-                start_row=11,
-                title="Invoice Schema",
-                description="Invoice Schema",
-            ),
-            Sheet(
-                schema=SCHEMAS / "commercialInstructionSchemas.yaml",
-                name="/buyer/commercialInstructions",
-                start_row=11,
-                title="Commercial Instructions Schema",
-                description="Commercial Instructions Schema",
-            ),
-            Sheet(
-                schema=SCHEMAS / "rfpsSchemas.yaml",
-                name="/buyer/RFP",
-                start_row=11,
-                title="RFP Schema",
-                description="RFP Schema",
-            ),
-            Sheet(
-                schema=SCHEMAS / "proposalSchemas.yaml",
-                name="/seller/proposal",
-                start_row=11,
-                title="Create a proposal to send to the buyer system",
-                description="Seller/Proposal Schemas",
-            ),
-            Sheet(
-                schema=temp_path / "buyer/ordersSchemas.yaml",
-                name="/buyer/order",
-                start_row=11,
-                title="Buyer requesting New Order or Order Change Request to Seller",
-                description="Buyer/Order",
-            ),
-            Sheet(
-                schema=temp_path / "buyer/ordersSchemas.yaml",
-                name="/buyer/order",
-                start_row=11,
-                title="Buyer requesting New Order or Order Change Request to Seller",
-                description="Buyer/Order",
-            ),
-            Sheet(
-                schema=temp_path / "seller/orderConfirmation.yaml",
-                name="/seller/orderConfirmation",
-                start_row=11,
-                title="",
-                description="",
-            ),
-            Sheet(
-                schema=temp_path / "buyer/orderRecall.yaml",
-                name="/buyer/orderRecall",
-                start_row=11,
-                title="",
-                description="",
-            ),
-            Sheet(
-                schema=temp_path / "seller/orderReject.yaml",
-                name="/seller/orderReject",
-                start_row=11,
-                title="",
-                description="",
-            ),
         ]
 
-        main(sheets)
-
-        # Post combine Orders.
-        # TODO: You're gonna have to do some manual work for now.
-        out_file = SCHEMAS / "ordersSchemas.yaml"
-        with out_file.open(mode="wb") as ofp:
-            for n in [
-                "buyer/ordersSchemas.yaml",
-                "seller/orderConfirmation.yaml",
-                "buyer/orderRecall.yaml",
-                "seller/orderReject.yaml",
-            ]:
-                with (temp_path / n).open("rb") as ifp:
-                    ofp.write(ifp.read())
+        parse_sheets(sheets)
 
         # Post combine InventoryAvails
         out_file = SCHEMAS / "inventoryAvailsSchemas.yaml"
@@ -510,4 +530,5 @@ def other_main():
 
 
 if __name__ == "__main__":
-    other_main()
+    _generate_schemas()
+    _generate_inventory_avails()

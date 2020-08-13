@@ -1,13 +1,13 @@
 {
   "name": "tip-initiative-apis",
-  "version": "1.0.0",
+  "version": "5.1.0",
   "description": "Repository of the current TIP APIs",
   "main": "index.js",
   "dependencies": {
     "@openapitools/openapi-generator-cli": "^1.0.12-4.3.0",
     "gitignore-to-dockerignore": "^1.0.0",
     "redoc-cli": "^0.9.7",
-    "swagger-ui": "^3.25.1"
+    "swagger-ui": "^3.31.1"
   },
   "devDependencies": {},
   "scripts": {
