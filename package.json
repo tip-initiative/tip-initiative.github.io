@@ -3,13 +3,13 @@
   "version": "5.1.0",
   "description": "Repository of the current TIP APIs",
   "main": "index.js",
-  "dependencies": {
+  "dependencies": {},
+  "devDependencies": {
     "@openapitools/openapi-generator-cli": "^1.0.12-4.3.0",
     "gitignore-to-dockerignore": "^1.0.0",
-    "redoc-cli": "^0.9.7",
+    "redoc-cli": "^0.9.10",
     "swagger-ui": "^3.31.1"
   },
-  "devDependencies": {},
   "scripts": {
     "test": "ls tip-initiative-apis/endpoints/*.yaml | xargs -n1 -P1 openapi-generator validate -i",
     "bundle": "redoc-cli bundle tip-initiative-apis/endpoints/api.yaml"
